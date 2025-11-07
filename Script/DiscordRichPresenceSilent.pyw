@@ -1,8 +1,17 @@
 #!/usr/bin/env python
-
+import datetime
+import hyprpy
+import json
+import logging
 import os
-
+import pypresence
 import sys
+import time
+
+from logging import handlers as logging_handlers
+from urllib.parse import urlparse
+
+from PIL import ImageGrab
 
 
 def assert_compatibility(required_version=0):
@@ -15,9 +24,6 @@ def assert_compatibility(required_version=0):
 
 
 assert_compatibility(3)
-is_windows = sys.platform.startswith('win')
-is_linux = sys.platform.startswith('linux')
-is_macos = sys.platform.startswith('darwin')
 process_version = "v1.8.1"
 process_hwnd = None
 is_process_running = False
@@ -56,7 +62,7 @@ def setup_logging(config=None, debug_mode=False):
     log_format = "%(asctime)s [%(levelname)s] %(message)s"
     log_date_style = "%m/%d/%Y %I:%M:%S %p"
     log_format_style = "%Y-%m-%d_%H-%M-%S"
-    start_timestamp = datetime.now().strftime(log_format_style)
+    start_timestamp = datetime.datetime.now().strftime(log_format_style)
 
     # Adjust log level depending on mode
     log_level = logging.INFO
@@ -87,7 +93,7 @@ def setup_logging(config=None, debug_mode=False):
     if "full" in log_modes or "multiple_files" in log_modes or "files" in log_modes:
         if not os.path.exists(log_path):
             os.makedirs(log_path)
-        staged_handler = TimedRotatingFileHandler(single_log_path, when="midnight", interval=1, encoding='utf-8')
+        staged_handler = logging_handlers.TimedRotatingFileHandler(single_log_path, when="midnight", interval=1, encoding='utf-8')
         staged_handler.suffix = start_timestamp
         staged_handler.namer = lambda name: name.replace(log_ext, "") + log_ext
         should_roll_over = os.path.isfile(single_log_path)
@@ -105,14 +111,6 @@ def setup_logging(config=None, debug_mode=False):
     return root_logger
 
 
-def callback(hwnd, extra):
-    global process_hwnd
-    global is_process_running
-    if (win32gui.GetWindowText(hwnd) == config["process_name"]):
-        process_hwnd = hwnd
-        is_process_running = True
-
-
 def main(debug_mode=False):
     """
     Main entrypoint (Should only be run when used as a script, and not when imported).
@@ -120,6 +118,8 @@ def main(debug_mode=False):
     # Global Definitions
     global process_hwnd
     global is_process_running
+    global hyprland_instance
+
     # Primary Variables
     event_key = "$$$"
     event_length = 11
@@ -127,6 +127,7 @@ def main(debug_mode=False):
     array_separator_key = "|"
     process_hwnd = None
     is_process_running = False
+    hyprland_instance = hyprpy.Hyprland()
 
     # RPC Data
     rpc_obj = None
@@ -142,16 +143,7 @@ def main(debug_mode=False):
 
     while True:
         process_hwnd = None
-        is_process_running = False
-        if is_windows:
-            win32gui.EnumWindows(callback, None)
-        elif is_linux and os.environ.get('XDG_SESSION_TYPE') == 'wayland':
-            # this can be removed once Pillow supports xdg-desktop-portal: https://github.com/python-pillow/Pillow/issues/6392
-            # pywinctl also throws issues with wayland: https://gitlab.com/CDAGaming/CraftPresence-Wow-Edition/-/issues/2
-            root_logger.error('Running on Linux/Wayland is not supported!')
-            exit(1)
-        else:
-            is_process_running = is_running(config["process_name"])
+        is_process_running = is_running(config["process_name"])
 
         if debug_mode:
             # if in DEBUG mode, squares are read, the image with the dot matrix is
@@ -182,7 +174,7 @@ def main(debug_mode=False):
 
                     while True:
                         try:
-                            rpc_obj = Presence(client_id=lines[0])
+                            rpc_obj = pypresence.Presence(client_id=lines[0])
                             rpc_obj.connect()
                         except Exception as exc:
                             root_logger.error("Unable to connect to Discord (%s)."
@@ -359,15 +351,24 @@ def is_running(window_title):
     """
     Check if there is any window that contains the given window_title.
     """
+    is_running = False
+
     # Iterate over the all the running process
-    for wnd in pwc.getAllWindows():
+    for wnd in hyprland_instance.get_windows():
         # Skip if window or title is None
         if wnd == None or wnd.title == None:
             continue
         # Check if process name contains the given name string.
         if window_title.lower() in wnd.title.lower():
-            return True
-    return False
+            is_running = True
+            break
+
+    return is_running
+
+
+def get_windows_with_title(title):
+    windows = hyprland_instance.get_windows()
+    return [window for window in windows if window.title == title]
 
 
 def interpret_offsets(left=0, top=0, right=0, bottom=0, left_offset=0, left_specific=0, top_offset=0, top_specific=0,
@@ -393,90 +394,23 @@ def interpret_offsets(left=0, top=0, right=0, bottom=0, left_offset=0, left_spec
     return left, top, right, bottom
 
 
-def take_screenshot(hwnd, window_type=0, left_offset=0, left_specific=0, top_offset=0, top_specific=0, right_offset=0,
-                    right_specific=0, bottom_offset=0, bottom_specific=0):
-    """
-    Takes a screenshot of the specified window, cropped to the specified offsets.
-    """
-    try:
-        # Change the line below depending on whether you want the whole window
-        # or just the client area.
-        left, top, right, bottom = win32gui.GetClientRect(hwnd)
-        # left, top, right, bottom = win32gui.GetWindowRect(hwnd)
-    except pywintypes.error:
-        # Fallback to specific offsets if GetClientRect fails
-        # Note: This is just a failsafe to prevent it from crashing
-        left, top, right, bottom = left_specific, top_specific, right_specific, bottom_specific
-
-    width = right - left
-    height = bottom - top
-
-    hwnd_dc = win32gui.GetWindowDC(hwnd)
-    mfc_dc = win32ui.CreateDCFromHandle(hwnd_dc)
-    save_dc = mfc_dc.CreateCompatibleDC()
-
-    save_bitmap = win32ui.CreateBitmap()
-    save_bitmap.CreateCompatibleBitmap(mfc_dc, width, height)
-
-    save_dc.SelectObject(save_bitmap)
-
-    windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), window_type)
-
-    bmpinfo = save_bitmap.GetInfo()
-    bmpstr = save_bitmap.GetBitmapBits(True)
-
-    im = Image.frombuffer(
-        'RGB',
-        (bmpinfo['bmWidth'], bmpinfo['bmHeight']),
-        bmpstr, 'raw', 'BGRX', 0, 1)
-
-    win32gui.DeleteObject(save_bitmap.GetHandle())
-    save_dc.DeleteDC()
-    mfc_dc.DeleteDC()
-    win32gui.ReleaseDC(hwnd, hwnd_dc)
-
-    # Calculate offsets and final width and height
-    left, top, right, bottom = interpret_offsets(left, top, right, bottom, left_offset, left_specific, top_offset,
-                                                 top_specific,
-                                                 right_offset, right_specific, bottom_offset, bottom_specific)
-
-    # Crop the image, using the calculated offsets
-    cropped_im = im.crop((left, top, right, bottom))
-
-    return cropped_im
-
-
 def read_squares(hwnd=None, event_length=0, event_key='', array_separator_key='', debug_mode=False):
     """
     Interpret a set of pixels, using the offsets and sizing from the config (Also perform sanity checks, if applicable).
     """
     im = None
-    if is_windows and hwnd:
-        try:
-            im = take_screenshot(
-                hwnd, config["window_type"],
-                config["left_offset"], config["left_specific"],
-                config["top_offset"], config["top_specific"],
-                config["right_offset"], config["right_specific"],
-                config["bottom_offset"], config["bottom_specific"]
-            )
-        except win32ui.error:
-            root_logger.debug('win32ui.error', exc_info=True)
-            return
-        except ValueError:
-            root_logger.error('Unable to retrieve enough Image Data, try resizing your window perhaps?')
-            return
-    else:
-        hwnd = pwc.getWindowsWithTitle(config["process_name"])[0]
-        left, top, right, bottom = hwnd.left, hwnd.top, (hwnd.left + hwnd.width), (hwnd.top + hwnd.height)
-        left, top, right, bottom = interpret_offsets(
-            left, top, right, bottom,
-            config["left_offset"], config["left_specific"],
-            config["top_offset"], config["top_specific"],
-            config["right_offset"], config["right_specific"],
-            config["bottom_offset"], config["bottom_specific"]
-        )
-        im = ImageGrab.grab(bbox=(left, top, right, bottom))
+
+    hwnd = get_windows_with_title(config["process_name"])[0]
+
+    left, top, right, bottom = hwnd.position_x, hwnd.position_y, (hwnd.position_x + hwnd.width), (hwnd.position_y + hwnd.height)
+    left, top, right, bottom = interpret_offsets(
+        left, top, right, bottom,
+        config["left_offset"], config["left_specific"],
+        config["top_offset"], config["top_specific"],
+        config["right_offset"], config["right_specific"],
+        config["bottom_offset"], config["bottom_specific"]
+    )
+    im = ImageGrab.grab(bbox=(left, top, right, bottom))
 
     if im.mode != 'RGB':
         im = im.convert('RGB')
@@ -537,34 +471,8 @@ def read_squares(hwnd=None, event_length=0, event_key='', array_separator_key=''
     return parts
 
 
-# Import Modules and perform Initial Setup
-try:
-    if is_windows:
-        from ctypes import windll
-        import win32gui
-        import win32ui
-        import pywintypes
-    from PIL import Image, ImageGrab
-    from pypresence import Presence
-    import pywinctl as pwc
-    # Universal Modules
-    import json
-    import logging
-    # Import Sub-Package Data
-    from datetime import datetime
-    from logging.handlers import TimedRotatingFileHandler
-    from urllib.parse import urlparse
-    import time
-except ModuleNotFoundError as err:
-    print(
-        "A module is missing (%s), preventing script execution! (Please review %s for Install Requirements)"
-        % (err.name, help_url)
-    )
-    input("Press Enter to continue...")
-    exit(1)
-else:
-    if __name__ == '__main__':
-        # Main Entrypoint Execution
-        config = load_config()
-        root_logger = setup_logging(config, config["debug"])
-        main(config["debug"])
+if __name__ == '__main__':
+    # Main Entrypoint Execution
+    config = load_config()
+    root_logger = setup_logging(config, config["debug"])
+    main(config["debug"])
